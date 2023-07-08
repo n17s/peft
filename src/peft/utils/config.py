@@ -32,6 +32,7 @@ class PeftType(str, enum.Enum):
     LORA = "LORA"
     ADALORA = "ADALORA"
     ADAPTION_PROMPT = "ADAPTION_PROMPT"
+    CIRCA = "CIRCA"
 
 
 class TaskType(str, enum.Enum):
