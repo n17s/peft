@@ -37,6 +37,90 @@ from ..utils import (
 )
 
 
+import time
+import atexit
+from collections import defaultdict
+from contextlib import contextmanager
+
+class TimerStats:
+    def __init__(self):
+        self.min_time = float('inf')
+        self.max_time = float('-inf')
+        self.sum_time = 0.0
+        self.count = 0
+
+class TimingManager:
+    def __init__(self):
+        self.timers = defaultdict(TimerStats)
+        atexit.register(self.print_report)
+
+    @contextmanager
+    def timer(self, key):
+        torch.cuda.synchronize()  # Wait for all CUDA operations to complete
+        start_time = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            torch.cuda.synchronize()  # Wait for all CUDA operations to complete
+            duration = time.perf_counter_ns() - start_time
+            stats = self.timers[key]
+            stats.min_time = min(stats.min_time, duration)
+            stats.max_time = max(stats.max_time, duration)
+            stats.sum_time += duration
+            stats.count += 1
+            if stats.count & (stats.count - 1) == 0:
+                # Print report every time stats.count is a power of 2
+                avg_time = stats.sum_time / stats.count
+                print(f"{key}: min={stats.min_time}, max={stats.max_time}, mean={avg_time}, count={stats.count}")
+
+    def print_report(self):
+        for key, stats in sorted(self.timers.items()):
+            if stats.count > 0:
+                avg_time = stats.sum_time / stats.count
+                print(f"{key}: min={stats.min_time}, max={stats.max_time}, mean={avg_time}")
+            else:
+                print(f"{key}: No timers were measured")
+
+manager = TimingManager()
+
+class TimedFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, key, operation, *args):
+        with manager.timer(f'{key}_forward'):
+            output = operation(*args)
+        ctx.save_for_backward(*args)
+        ctx.key = key
+        ctx.operation = operation
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        args = ctx.saved_tensors
+        input = args[0]
+        weight = args[1]
+        with manager.timer(f'{ctx.key}_backward'):
+            grad_input = grad_output @ weight.t()
+            grad_weight = input.t() @ grad_output
+            grad_bias = grad_output.sum(0) if len(args) == 3 else None
+        return (None, None) + (grad_input, grad_weight, grad_bias)
+
+
+def timed_linear(input, weight, bias=None, key='linear'):
+    return TimedFunction.apply(key, torch.nn.functional.linear, input, weight, bias)
+
+
+class TimedLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias=True, key='linear'):
+        super().__init__(in_features, out_features, bias)
+        self.key = key
+
+    def forward(self, input):
+        return TimedFunction.apply(self.key, self._linear_op, input, self.weight, self.bias)
+
+    def _linear_op(self, input, weight, bias):
+        return torch.nn.functional.linear(input, weight, bias)
+
+
 if is_bnb_available():
     import bitsandbytes as bnb
 
@@ -297,7 +381,8 @@ class LoraModel(torch.nn.Module):
                     f"Target module {target} is not supported. "
                     f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
                 )
-            new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
+            new_module = TimedLinear(in_features, out_features, bias=bias, key=adapter_name)
+            #new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
 
         return new_module
 
@@ -454,7 +539,8 @@ class LoraModel(torch.nn.Module):
                     )
                 else:
                     bias = target.bias is not None
-                    new_module = torch.nn.Linear(target.in_features, target.out_features, bias=bias)
+                    new_module = TimedLinear(target.in_features, target.out_features, bias=bias, key=target_name)
+                    #new_module = torch.nn.Linear(target.in_features, target.out_features, bias=bias)
                 target.merge()
                 self._replace_module(parent, target_name, new_module, target)
 
@@ -558,8 +644,8 @@ class LoraLayer:
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
         if r > 0:
-            self.lora_A.update(nn.ModuleDict({adapter_name: nn.Linear(self.in_features, r, bias=False)}))
-            self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(r, self.out_features, bias=False)}))
+            self.lora_A.update(nn.ModuleDict({adapter_name: TimedLinear(self.in_features, r, bias=False, key=f'lora_A_{adapter_name}')}))
+            self.lora_B.update(nn.ModuleDict({adapter_name: TimedLinear(r, self.out_features, bias=False, key=f'lora_B_{adapter_name}')}))
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
@@ -621,7 +707,7 @@ class LoraLayer:
             nn.init.normal_(self.lora_embedding_B[adapter_name])
 
 
-class Linear(nn.Linear, LoraLayer):
+class Linear(TimedLinear, LoraLayer):
     # Lora implemented in a dense layer
     def __init__(
         self,
@@ -636,7 +722,7 @@ class Linear(nn.Linear, LoraLayer):
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
 
-        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        TimedLinear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
         self.weight.requires_grad = False
@@ -645,7 +731,7 @@ class Linear(nn.Linear, LoraLayer):
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
 
-        nn.Linear.reset_parameters(self)
+        TimedLinear.reset_parameters(self)
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
 
@@ -684,13 +770,16 @@ class Linear(nn.Linear, LoraLayer):
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
         if self.active_adapter not in self.lora_A.keys():
-            return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+            return timed_linear(x, transpose(self.weight, self.fan_in_fan_out), self.bias, key=f'base_{self.active_adapter}')
+            #return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
         if self.disable_adapters:
             if self.r[self.active_adapter] > 0 and self.merged:
                 self.unmerge()
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+            result = timed_linear(x, transpose(self.weight, self.fan_in_fan_out), self.bias, key=f'base_{self.active_adapter}')
+            #result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
         elif self.r[self.active_adapter] > 0 and not self.merged:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+            result = timed_linear(x, transpose(self.weight, self.fan_in_fan_out), self.bias, key=f'base_{self.active_adapter}')
+            #result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
             x = x.to(self.lora_A[self.active_adapter].weight.dtype)
 
@@ -701,7 +790,8 @@ class Linear(nn.Linear, LoraLayer):
                 * self.scaling[self.active_adapter]
             )
         else:
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+            result = timed_linear(x, transpose(self.weight, self.fan_in_fan_out), self.bias, key=f'base_{self.active_adapter}')
+            #result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
         result = result.to(previous_dtype)
 
