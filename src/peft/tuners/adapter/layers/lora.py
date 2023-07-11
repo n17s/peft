@@ -56,7 +56,7 @@ class LoraLinear(nn.Linear, LoraLinearAdapter):
             self.weight.data = self.weight.data.T
 
         nn.Linear.reset_parameters(self)
-        self.update_layer(adapter_name, adapter_config)
+        LoraLinearAdapter.update_layer(self, adapter_name, adapter_config)
         self.active_adapter = adapter_name
 
     def merge(self):
@@ -446,11 +446,11 @@ if is_bnb_available():
                 return result
 
 DEFAULT_LORA_ADAPTER_LAYERS_CONFIG = AdapterLayersConfig(
-    lora_linear_layer=LoraLinearAdapter,
+    linear_layer=LoraLinear,
     linear_8bit_layer=Linear8bitLt if is_bnb_available() else None,
     linear_4bit_layer=Linear4bit if is_bnb_4bit_available() else None,
-    lora_conv2d_layer=LoraConv2dAdapter,
-    lora_embedding_layer=LoraEmbeddingAdapter
+    conv2d_layer=LoraConv2d,
+    embedding_layer=LoraEmbedding
 )
 
 @dataclass

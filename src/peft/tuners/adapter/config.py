@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import List, Optional, Tuple, Union
 
-from ...utils import PeftConfig
+from ...utils import PeftConfig, PeftType
 
 
 @dataclass
@@ -76,6 +76,7 @@ class AdapterConfig(PeftConfig):
         },
     )
     adapter_layers_config: AdapterLayersConfig = field(default = AdapterLayersConfig(), metadata={"help": "The adapter layer classes to use"})
+    peft_type: PeftType = field(default=PeftType.ADAPTER, metadata={"help": "Defaults to PeftType.ADAPTER"})
 
     
 

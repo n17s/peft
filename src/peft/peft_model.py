@@ -44,6 +44,8 @@ from .tuners import (
     PromptEmbedding,
     PromptEncoder,
 )
+from .tuners.adapter.model import AdapterModel
+
 from .utils import (
     SAFETENSORS_WEIGHTS_NAME,
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
@@ -63,6 +65,7 @@ from .utils import (
 
 
 PEFT_TYPE_TO_MODEL_MAPPING = {
+    PeftType.ADAPTER: AdapterModel,
     PeftType.LORA: LoraModel,
     PeftType.PROMPT_TUNING: PromptEmbedding,
     PeftType.P_TUNING: PromptEncoder,

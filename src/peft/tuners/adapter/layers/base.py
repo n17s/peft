@@ -2,8 +2,6 @@ import torch.nn as nn
 import math
 
 from abc import ABC, abstractmethod
-from raft_lora.components.train.peft.src.peft.tuners.adapter.config import AdapterConfig 
-
 from ..config import AdapterConfig
 
 class AdapterLayer(ABC):
@@ -21,7 +19,7 @@ class AdapterLayer(ABC):
         if adapter_config.r > 0:
             self.update_modules(adapter_name, adapter_config)
         if adapter_config.init_weights:
-            self.reset_parameters(adapter_name)
+            self.reinit_parameters(adapter_name)
         self.to(self.weight.device)
 
     @abstractmethod
@@ -29,7 +27,7 @@ class AdapterLayer(ABC):
         raise NotImplementedError()
     
     @abstractmethod
-    def reset_parameters(self, adapter_name: str):
+    def reinit_parameters(self, adapter_name: str):
         raise NotImplementedError()
 
     def update_dropout(self, adapter_name: str, adapter_config: AdapterConfig):
@@ -53,7 +51,7 @@ class LinearAdapter(AdapterLayer):
         self.adapter_A.update(nn.ModuleDict({adapter_name: nn.Linear(self.in_features, adapter_config.r, bias=False)}))
         self.adapter_B.update(nn.ModuleDict({adapter_name: nn.Linear(adapter_config.r, self.out_features, bias=False)}))
 
-    def reset_parameters(self, adapter_name: str):
+    def reinit_parameters(self, adapter_name: str):
         if adapter_name in self.adapter_A.keys():
             nn.init.kaiming_uniform_(self.adapter_A[adapter_name].weight, a=math.sqrt(5))
             nn.init.zeros_(self.adapter_B[adapter_name].weight)
@@ -84,7 +82,7 @@ class EmbeddingAdapter(AdapterLayer):
             nn.ParameterDict({adapter_name: nn.Parameter(self.weight.new_zeros((self.out_features, adapter_config.r)))})
         )
 
-    def reset_parameters(self, adapter_name: str):
+    def reinit_parameters(self, adapter_name: str):
         if adapter_name in self.adapter_embedding_A.keys():
             nn.init.zeros_(self.adapter_embedding_A[adapter_name])
             nn.init.normal_(self.adapter_embedding_B[adapter_name])

@@ -44,6 +44,7 @@ class AdapterModel(torch.nn.Module):
     def __init__(self, model: PreTrainedModel, config: AdapterConfig, adapter_name: str):
         super().__init__()
         self.model = model
+        self.forward = self.model.forward
         self.peft_config = config
         self.add_adapter(adapter_name)
 
@@ -57,7 +58,7 @@ class AdapterModel(torch.nn.Module):
             raise ValueError(
                 "AdapterModel supports only 1 adapter with bias. When using multiple adapters, set bias to 'none' for all adapters."
             )
-        self.mark_only_adapter_layers_as_trainable(self.model, self.peft_config[adapter_name].bias)
+        self.mark_only_adapter_layers_as_trainable(adapter_name)
         if self.peft_config[adapter_name].inference_mode:
             _freeze_adapter(self.model, adapter_name)
 
@@ -86,7 +87,7 @@ class AdapterModel(torch.nn.Module):
             if isinstance(target, AdapterLayer):
                 target.update_layer(adapter_name, adapter_config)
             else:
-                new_module = self._create_new_module(adapter_config, adapter_name, target)
+                new_module = self._create_new_module(adapter_name, target)
                 self._replace_module(parent, target_name, new_module, target)
 
         if not is_target_modules_in_base_model:
@@ -216,6 +217,7 @@ class AdapterModel(torch.nn.Module):
         for n, p in model.named_parameters():
             if "adapter_" not in n:
                 p.requires_grad = False
+
         if bias == "none":
             return
         elif bias == "all":
