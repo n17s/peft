@@ -25,10 +25,14 @@
 	// "remoteUser": "root"
 
 	"containerEnv": {
-		"NVIDIA_VISIBLE_DEVICES": "0,1,2,3"
+		"NVIDIA_VISIBLE_DEVICES": "3",
+		"HF_HOME": "/home/nikosk/.cache/huggingface"
 	},
 
 	"runArgs": [
+		"-v", "/dev/shm:/dev/shm",
+		"-v", "/home/nikosk/:/home/nikosk/",
+		"--gpus", "all",
 		"--runtime=nvidia"
 	]
 }

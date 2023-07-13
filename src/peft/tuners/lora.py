@@ -87,7 +87,7 @@ class TimedFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, key, operation, *args):
         with manager.timer(f'{key}_forward'):
-            output = operation(*args)
+            output = operation(*args).clone()  # cloning the tensor here
         ctx.save_for_backward(*args)
         ctx.key = key
         ctx.operation = operation
@@ -98,10 +98,22 @@ class TimedFunction(torch.autograd.Function):
         args = ctx.saved_tensors
         input = args[0]
         weight = args[1]
+        bias = args[2] if len(args) == 3 else None
         with manager.timer(f'{ctx.key}_backward'):
-            grad_input = grad_output @ weight.t()
-            grad_weight = input.t() @ grad_output
-            grad_bias = grad_output.sum(0) if len(args) == 3 else None
+            grad_input = grad_output @ weight if input.requires_grad else None
+            if weight.requires_grad or (bias is not None and bias.requires_grad):
+                flattened_grad_output = grad_output.view(-1, grad_output.shape[-1]) if grad_output.dim() > 2 else grad_output
+                if weight.requires_grad:
+                    if 'lora_' not in ctx.key:
+                        print(f'the weight of {ctx.key} should not require grad')
+                    flattened_input = input.view(-1, input.shape[-1]) if input.dim() > 2 else input
+                    grad_weight = flattened_grad_output.t() @ flattened_input
+                else:
+                    grad_weight = None
+                grad_bias = flattened_grad_output.sum(0) if bias is not None and bias.requires_grad else None
+            else:
+                grad_weight = None
+                grad_bias = None
         return (None, None) + (grad_input, grad_weight, grad_bias)
 
 
@@ -381,8 +393,8 @@ class LoraModel(torch.nn.Module):
                     f"Target module {target} is not supported. "
                     f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
                 )
-            new_module = TimedLinear(in_features, out_features, bias=bias, key=adapter_name)
-            #new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
+            #new_module = TimedLinear(in_features, out_features, bias=bias, key=adapter_name)
+            new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
 
         return new_module
 
@@ -598,9 +610,18 @@ class LoraModel(torch.nn.Module):
 
 # had to adapt it for `lora_only` to work
 def mark_only_lora_as_trainable(model: nn.Module, bias: str = "none") -> None:
+    req_grad = []
+    not_req_grad = []
     for n, p in model.named_parameters():
         if "lora_" not in n:
             p.requires_grad = False
+            req_grad.append(n)
+        else:
+            not_req_grad.append(n)
+    print("requires grad")
+    print(sorted(req_grad))
+    print("does NOT require grad")
+    print(sorted(not_req_grad))
     if bias == "none":
         return
     elif bias == "all":
