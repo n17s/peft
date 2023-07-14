@@ -25,14 +25,51 @@ class LoraAdapter(AdapterLayer):
         self.scaling[adapter_name] = adapter_config.lora_alpha / adapter_config.r
 
 class LoraLinearAdapter(LoraAdapter, LinearAdapter):
-    pass
+    def materialize_adapter(self, adapter_name: str):
+        if self.r[adapter_name] > 0:
+            return (
+                transpose(
+                    self.adapter_B[adapter_name].weight @ self.adapter_A[adapter_name].weight,
+                    self.fan_in_fan_out,
+                )
+                * self.scaling[adapter_name]
+            )
+        else:
+            return None
 
 class LoraConv2dAdapter(LoraAdapter, Conv2dAdapter):
-    pass
+    def materialize_adapter(self, adapter_name: str):
+        if self.r[adapter_name] > 0:
+            # https://github.com/bmaltais/kohya_ss/blob/feb6728762a8f463d15ba936d189d4c3abfaa1ab/networks/lora.py#L117
+            if self.weight.size()[2:4] == (1, 1):
+                # conv2d 1x1
+                return (
+                    self.adapter_B[adapter_name].weight.squeeze(3).squeeze(2)
+                    @ self.adapter_A[adapter_name].weight.squeeze(3).squeeze(2)
+                ).unsqueeze(2).unsqueeze(3) * self.scaling[adapter_name]
+            else:
+                # conv2d 3x3
+                return (
+                    F.conv2d(
+                        self.adapter_A[adapter_name].weight.permute(1, 0, 2, 3),
+                        self.adapter_B[adapter_name].weight,
+                    ).permute(1, 0, 2, 3)
+                    * self.scaling[adapter_name]
+                )
+        else:
+            return None
 
 class LoraEmbeddingAdapter(LoraAdapter, EmbeddingAdapter):
-    pass
-
+    def materialize_adapter(self, adapter_name: str):
+        if self.r[adapter_name] > 0:
+            return (
+                transpose(
+                    self.adapter_embedding_B[adapter_name] @ self.adapter_embedding_A[adapter_name], True
+                )
+                * self.scaling[adapter_name]
+            )
+        else:
+            return None
 
 class LoraLinear(nn.Linear, LoraLinearAdapter):
     # Lora implemented in a dense layer
@@ -59,49 +96,17 @@ class LoraLinear(nn.Linear, LoraLinearAdapter):
         LoraLinearAdapter.update_layer(self, adapter_name, adapter_config)
         self.active_adapter = adapter_name
 
-    def merge(self):
-        if self.active_adapter not in self.adapter_A.keys():
-            return
-        if self.merged:
-            warnings.warn("Already merged. Nothing to do.")
-            return
-        if self.r[self.active_adapter] > 0:
-            self.weight.data += (
-                transpose(
-                    self.adapter_B[self.active_adapter].weight @ self.adapter_A[self.active_adapter].weight,
-                    self.fan_in_fan_out,
-                )
-                * self.scaling[self.active_adapter]
-            )
-            self.merged = True
-
-    def unmerge(self):
-        if self.active_adapter not in self.adapter_A.keys():
-            return
-        if not self.merged:
-            warnings.warn("Already unmerged. Nothing to do.")
-            return
-        if self.r[self.active_adapter] > 0:
-            self.weight.data -= (
-                transpose(
-                    self.adapter_B[self.active_adapter].weight @ self.adapter_A[self.active_adapter].weight,
-                    self.fan_in_fan_out,
-                )
-                * self.scaling[self.active_adapter]
-            )
-            self.merged = False
-
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
         if self.active_adapter not in self.adapter_A.keys():
             return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+        
         if self.disable_adapters:
             if self.r[self.active_adapter] > 0 and self.merged:
                 self.unmerge()
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
         elif self.r[self.active_adapter] > 0 and not self.merged:
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-
             x = x.to(self.adapter_A[self.active_adapter].weight.dtype)
 
             result += (
@@ -114,7 +119,6 @@ class LoraLinear(nn.Linear, LoraLinearAdapter):
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
         result = result.to(previous_dtype)
-
         return result
 
 
@@ -128,76 +132,38 @@ class LoraEmbedding(nn.Embedding, LoraEmbeddingAdapter):
         adapter_config: AdapterConfig,
         **kwargs,
     ):
-        init_lora_weights = kwargs.pop("init_lora_weights", True)
-
         nn.Embedding.__init__(self, num_embeddings, embedding_dim, **kwargs)
         LoraEmbeddingAdapter.__init__(self, in_features=num_embeddings, out_features=embedding_dim)
-
         self.weight.requires_grad = False
 
         nn.Embedding.reset_parameters(self)
         self.update_layer(adapter_name, adapter_config)
         self.active_adapter = adapter_name
 
-    def unmerge(self, mode: bool = True):
-        if not self.merged:
-            warnings.warn("Already unmerged. Nothing to do.")
-            return
-        if self.r[self.active_adapter] > 0:
-            self.weight.data -= (
-                transpose(
-                    self.adapter_embedding_B[self.active_adapter] @ self.adapter_embedding_A[self.active_adapter], True
-                )
-                * self.scaling[self.active_adapter]
-            )
-            self.merged = False
-
-    def merge(self):
-        if self.merged:
-            warnings.warn("Already merged. Nothing to do.")
-            return
-        if self.r[self.active_adapter] > 0:
-            self.weight.data += (
-                transpose(
-                    self.adapter_embedding_B[self.active_adapter] @ self.adapter_embedding_A[self.active_adapter], True
-                )
-                * self.scaling[self.active_adapter]
-            )
-            self.merged = True
-
     def forward(self, x: torch.Tensor):
         if self.disable_adapters:
             if self.r[self.active.adapter] > 0 and self.merged:
-                self.weight.data -= (
-                    transpose(
-                        self.adapter_embedding_B[self.active_adapter].weight
-                        @ self.adapter_embedding_A[self.active_adapter].weight,
-                        True,
-                    )
-                    * self.scaling[self.active_adapter]
-                )
-                self.merged = False
+                self.unmerge()
             return nn.Embedding.forward(self, x)
 
         elif self.r[self.active_adapter] > 0 and not self.merged:
             result = nn.Embedding.forward(self, x)
-            if self.r[self.active_adapter] > 0:
-                after_A = F.embedding(
-                    x,
-                    self.adapter_embedding_A[self.active_adapter].T,
-                    self.padding_idx,
-                    self.max_norm,
-                    self.norm_type,
-                    self.scale_grad_by_freq,
-                    self.sparse,
-                )
-                result += (after_A @ self.adapter_embedding_B[self.active_adapter].T) * self.scaling[self.active_adapter]
+            after_A = F.embedding(
+                x,
+                self.adapter_embedding_A[self.active_adapter].T,
+                self.padding_idx,
+                self.max_norm,
+                self.norm_type,
+                self.scale_grad_by_freq,
+                self.sparse,
+            )
+            result += (after_A @ self.adapter_embedding_B[self.active_adapter].T) * self.scaling[self.active_adapter]
             return result
         else:
             return nn.Embedding.forward(self, x)
 
 
-class LoraConv2d(nn.Conv2d, Conv2dAdapter):
+class LoraConv2d(nn.Conv2d, LoraConv2dAdapter):
     # Lora implemented in a conv2d layer
     def __init__(
         self,
@@ -211,7 +177,7 @@ class LoraConv2d(nn.Conv2d, Conv2dAdapter):
         **kwargs,
     ):
         nn.Conv2d.__init__(self, in_channels, out_channels, kernel_size, stride, padding)
-        Conv2dAdapter.__init__(
+        LoraConv2dAdapter.__init__(
             self,
             in_features=in_channels,
             out_features=out_channels,
@@ -225,55 +191,6 @@ class LoraConv2d(nn.Conv2d, Conv2dAdapter):
         nn.Conv2d.reset_parameters(self)
         self.update_layer(adapter_name, adapter_config)
         self.active_adapter = adapter_name
-
-    def merge(self):
-        if self.active_adapter not in self.adapter_A.keys():
-            return
-        if self.merged:
-            warnings.warn("Already merged. Nothing to do.")
-            return
-        if self.r[self.active_adapter] > 0:
-            # https://github.com/bmaltais/kohya_ss/blob/feb6728762a8f463d15ba936d189d4c3abfaa1ab/networks/lora.py#L117
-            if self.weight.size()[2:4] == (1, 1):
-                # conv2d 1x1
-                self.weight.data += (
-                    self.adapter_B[self.active_adapter].weight.squeeze(3).squeeze(2)
-                    @ self.adapter_A[self.active_adapter].weight.squeeze(3).squeeze(2)
-                ).unsqueeze(2).unsqueeze(3) * self.scaling[self.active_adapter]
-            else:
-                # conv2d 3x3
-                self.weight.data += (
-                    F.conv2d(
-                        self.adapter_A[self.active_adapter].weight.permute(1, 0, 2, 3),
-                        self.adapter_B[self.active_adapter].weight,
-                    ).permute(1, 0, 2, 3)
-                    * self.scaling[self.active_adapter]
-                )
-            self.merged = True
-
-    def unmerge(self):
-        if self.active_adapter not in self.adapter_A.keys():
-            return
-        if not self.merged:
-            warnings.warn("Already unmerged. Nothing to do.")
-            return
-        if self.r[self.active_adapter] > 0:
-            if self.weight.size()[2:4] == (1, 1):
-                # conv2d 1x1
-                self.weight.data -= (
-                    self.adapter_B[self.active_adapter].weight.squeeze(3).squeeze(2)
-                    @ self.adapter_A[self.active_adapter].weight.squeeze(3).squeeze(2)
-                ).unsqueeze(2).unsqueeze(3) * self.scaling[self.active_adapter]
-            else:
-                # conv2d 3x3
-                self.weight.data += (
-                    F.conv2d(
-                        self.adapter_A[self.active_adapter].weight.permute(1, 0, 2, 3),
-                        self.adapter_B[self.active_adapter].weight,
-                    ).permute(1, 0, 2, 3)
-                    * self.scaling[self.active_adapter]
-                )
-            self.merged = False
 
     def forward(self, x: torch.Tensor):
         previous_dtype = x.dtype
